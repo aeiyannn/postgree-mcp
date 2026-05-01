@@ -8,29 +8,37 @@ import * as dotenv from "dotenv";
 
 dotenv.config();
 
-// ── PostgreSQL Connection ────────────────────────────────────────────
+// ── PostgreSQL Connection Helper ────────────────────────────────────
 
-const poolConfig: PoolConfig = {
-  host: process.env.PG_HOST || "localhost",
-  port: parseInt(process.env.PG_PORT || "5432", 10),
-  user: process.env.PG_USER || "postgres",
-  password: process.env.PG_PASSWORD || "postgres",
-  database: process.env.PG_DATABASE || "postgres",
-  max: 10,
-  idleTimeoutMillis: 30000,
-  connectionTimeoutMillis: 5000,
-  ssl: process.env.PG_CA_CERT
-    ? { ca: process.env.PG_CA_CERT }
-    : process.env.PG_SSL === "true"
-      ? { rejectUnauthorized: false }
-      : false,
+const getPoolConfigFromHeaders = (headers: any): PoolConfig => {
+  const host = headers["x-pg-host"] || process.env.PG_HOST || "localhost";
+  const port = parseInt(headers["x-pg-port"] || process.env.PG_PORT || "5432", 10);
+  const user = headers["x-pg-user"] || process.env.PG_USER || "postgres";
+  const password = headers["x-pg-password"] || process.env.PG_PASSWORD || "postgres";
+  const database = headers["x-pg-database"] || process.env.PG_DATABASE || "postgres";
+  const caCert = headers["x-pg-ca-cert"] || process.env.PG_CA_CERT;
+  const sslHeader = headers["x-pg-ssl"] || process.env.PG_SSL;
+
+  return {
+    host,
+    port,
+    user,
+    password,
+    database,
+    max: 10,
+    idleTimeoutMillis: 30000,
+    connectionTimeoutMillis: 5000,
+    ssl: caCert
+      ? { ca: caCert }
+      : sslHeader === "true"
+        ? { rejectUnauthorized: false }
+        : false,
+  };
 };
-
-const pool = new Pool(poolConfig);
 
 // ── MCP Server Factory ───────────────────────────────────────────────
 
-const createMcpServer = () => {
+const createMcpServer = (pool: Pool) => {
   const server = new McpServer({
     name: "postgres-mcp-server",
     version: "1.0.0",
@@ -371,32 +379,44 @@ const app = express();
 app.use(cors());
 
 // Store active transports so we can route messages back
-const transports: Record<string, SSEServerTransport> = {};
+const transports: Record<string, { transport: SSEServerTransport; pool: Pool }> = {};
 
 // SSE endpoint — clients connect here to receive events
 app.get("/sse", async (req, res) => {
+  const poolConfig = getPoolConfigFromHeaders(req.headers);
+  const sessionPool = new Pool(poolConfig);
+
   const transport = new SSEServerTransport("/messages", res);
-  const server = createMcpServer();
-  transports[transport.sessionId] = transport;
-  res.on("close", () => {
-    delete transports[transport.sessionId];
+  const server = createMcpServer(sessionPool);
+
+  transports[transport.sessionId] = { transport, pool: sessionPool };
+
+  res.on("close", async () => {
+    const session = transports[transport.sessionId];
+    if (session) {
+      await session.pool.end().catch((err) => console.error("Error closing pool:", err));
+      delete transports[transport.sessionId];
+    }
   });
+
   await server.connect(transport);
 });
 
 // Message endpoint — clients POST JSON-RPC messages here
 app.post("/messages", async (req, res) => {
   const sessionId = req.query.sessionId as string;
-  const transport = transports[sessionId];
-  if (!transport) {
+  const session = transports[sessionId];
+  if (!session) {
     res.status(400).json({ error: "Invalid or missing sessionId" });
     return;
   }
-  await transport.handlePostMessage(req, res);
+  await session.transport.handlePostMessage(req, res);
 });
 
 app.listen(PORT, () => {
   console.log(`PostgreSQL MCP Server running at http://localhost:${PORT}`);
   console.log(`  SSE endpoint:     http://localhost:${PORT}/sse`);
   console.log(`  Message endpoint:  http://localhost:${PORT}/messages`);
+  console.log(`  Connection data will be read from "x-pg-*" headers.`);
 });
+
